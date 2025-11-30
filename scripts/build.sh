@@ -3,7 +3,7 @@
 ## WebRTC library build script
 ## Created by Stasel
 ## BSD-3 License
-## 
+##
 ## Example usage: MACOS=true IOS=true BUILD_VP9=true sh build.sh
 
 # Configs
@@ -15,10 +15,12 @@ MACOS="${MACOS:-false}"
 MAC_CATALYST="${MAC_CATALYST:-false}"
 
 OUTPUT_DIR="./out"
-XCFRAMEWORK_DIR="out/WebRTC.xcframework"
+XCFRAMEWORK_DIR="out/WebRTC.xcframework"  # 用于存放静态库的 XCFramework 目录
+STATIC_LIB_DIR="out/static_libs"  # 静态库输出目录
 COMMON_GN_ARGS="is_debug=${DEBUG} rtc_libvpx_build_vp9=${BUILD_VP9} is_component_build=false rtc_include_tests=false rtc_enable_objc_symbol_export=true enable_stripping=true enable_dsyms=false use_lld=true rtc_ios_use_opengl_rendering=true"
 PLISTBUDDY_EXEC="/usr/libexec/PlistBuddy"
 
+# Build functions for iOS, macOS, Catalyst (similar to previous steps)
 build_iOS() {
     local arch=$1
     local environment=$2
@@ -26,7 +28,7 @@ build_iOS() {
     local gen_args="${COMMON_GN_ARGS} target_cpu=\"${arch}\" target_os=\"ios\" target_environment=\"${environment}\" ios_deployment_target=\"12.0\" ios_enable_code_signing=false"
     gn gen "${gen_dir}" --args="${gen_args}"
     gn args --list ${gen_dir} > ${gen_dir}/gn-args.txt
-    ninja -C "${gen_dir}" framework_objc || exit 1
+    ninja -C "${gen_dir}" rtc_base rtc_api rtc_video  # Only static library targets
 }
 
 build_macOS() {
@@ -35,39 +37,7 @@ build_macOS() {
     local gen_args="${COMMON_GN_ARGS} target_cpu=\"${arch}\" target_os=\"mac\""
     gn gen "${gen_dir}" --args="${gen_args}"
     gn args --list ${gen_dir} > ${gen_dir}/gn-args.txt
-    ninja -C "${gen_dir}" mac_framework_objc || exit 1
-}
-
-# Catalyst builds are not working properly yet. 
-# See: https://groups.google.com/g/discuss-webrtc/c/VZXS4V4mSY4
-build_catalyst() {
-    local arch=$1
-    local gen_dir="${OUTPUT_DIR}/catalyst-${arch}"
-    local gen_args="${COMMON_GN_ARGS} target_cpu=\"${arch}\" target_environment=\"catalyst\" target_os=\"ios\" ios_deployment_target=\"14.0\" ios_enable_code_signing=false"
-    gn gen "${gen_dir}" --args="${gen_args}"
-    gn args --list ${gen_dir} > ${gen_dir}/gn-args.txt
-    ninja -C "${gen_dir}" framework_objc || exit 1
-}
-
-plist_add_library() {
-    local index=$1
-    local identifier=$2
-    local platform=$3
-    local platform_variant=$4
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries: dict"  "${INFO_PLIST}"
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:LibraryIdentifier string ${identifier}"  "${INFO_PLIST}"
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:LibraryPath string WebRTC.framework"  "${INFO_PLIST}"
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:SupportedArchitectures array"  "${INFO_PLIST}"
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:SupportedPlatform string ${platform}"  "${INFO_PLIST}"
-    if [ ! -z "$platform_variant" ]; then
-        "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:SupportedPlatformVariant string ${platform_variant}" "${INFO_PLIST}"
-    fi
-}
-
-plist_add_architecture() {
-    local index=$1
-    local arch=$2
-    "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries:${index}:SupportedArchitectures: string ${arch}"  "${INFO_PLIST}"
+    ninja -C "${gen_dir}" rtc_base rtc_api rtc_video  # Only static library targets
 }
 
 # Step 1: Download and install depot tools
@@ -91,12 +61,11 @@ cd ..
 gclient sync --with_branch_heads --with_tags
 cd src
 
-# Step 3 - Compile and build all frameworks
-rm -rf $OUTPUT_DIR  
+# Step 3 - Compile and build all static libraries
+rm -rf $OUTPUT_DIR
 
 if [ "$IOS" = true ]; then
-    build_iOS "x64" "simulator"
-    build_iOS "arm64" "simulator"
+    # Only build iOS arm64 (real device)
     build_iOS "arm64" "device"
 fi
 
@@ -105,61 +74,31 @@ if [ "$MACOS" = true ]; then
     build_macOS "arm64"
 fi
 
-if [ "$MAC_CATALYST" = true ]; then
-    build_catalyst "x64"
-    build_catalyst "arm64"
-fi
-
-# Step 4 - Manually create XCFramework.
-# Unfortunately we cannot use xcodebuild `-xcodebuild -create-xcframework` because of an error:
-# "Both ios-arm64-simulator and ios-x86_64-simulator represent two equivalent library definitions."
-# Therefore, we craft the XCFramework manually with multi architecture binaries created by lipo.
-# We also use plistbuddy to create the plist for the XCFramework
-
+# Step 4 - Create XCFramework to include static libs
 INFO_PLIST="${XCFRAMEWORK_DIR}/Info.plist"
 rm -rf "${XCFRAMEWORK_DIR}"
 mkdir "${XCFRAMEWORK_DIR}"
-"$PLISTBUDDY_EXEC" -c "Add :CFBundlePackageType string XFWK"  "${INFO_PLIST}"
+"$PLISTBUDDY_EXEC" -c "Add :CFBundlePackageType string XFWK"  "${INFO_PLIST}"  # Set package type as XFWK
 "$PLISTBUDDY_EXEC" -c "Add :XCFrameworkFormatVersion string 1.0"  "${INFO_PLIST}"
 "$PLISTBUDDY_EXEC" -c "Add :AvailableLibraries array" "${INFO_PLIST}"
 
-# Step 5.1 - Add iOS libs to XCFramework
+# Add iOS static libs
 LIB_COUNT=0
 if [[ "$IOS" = true ]]; then
-
     IOS_LIB_IDENTIFIER="ios-arm64"
-    IOS_SIM_LIB_IDENTIFIER="ios-x86_64_arm64-simulator"
 
     mkdir "${XCFRAMEWORK_DIR}/${IOS_LIB_IDENTIFIER}"
-    mkdir "${XCFRAMEWORK_DIR}/${IOS_SIM_LIB_IDENTIFIER}"
-    LIB_IOS_INDEX=0
-    LIB_IOS_SIMULATOR_INDEX=1
-    plist_add_library $LIB_IOS_INDEX $IOS_LIB_IDENTIFIER "ios"
-    plist_add_library $LIB_IOS_SIMULATOR_INDEX $IOS_SIM_LIB_IDENTIFIER "ios" "simulator"
+    plist_add_library $LIB_COUNT $IOS_LIB_IDENTIFIER "ios"
 
-    cp -r out/ios-arm64-device/WebRTC.framework "${XCFRAMEWORK_DIR}/${IOS_LIB_IDENTIFIER}"
-    cp -r out/ios-x64-simulator/WebRTC.framework "${XCFRAMEWORK_DIR}/${IOS_SIM_LIB_IDENTIFIER}"
+    cp -r out/ios-arm64-device/libwebrtc.a "${XCFRAMEWORK_DIR}/${IOS_LIB_IDENTIFIER}"
 
-    LIPO_IOS_FLAGS="out/ios-arm64-device/WebRTC.framework/WebRTC"
-    LIPO_IOS_SIM_FLAGS="out/ios-x64-simulator/WebRTC.framework/WebRTC out/ios-arm64-simulator/WebRTC.framework/WebRTC"
+    plist_add_architecture $LIB_COUNT "arm64"
 
-    plist_add_architecture $LIB_IOS_INDEX "arm64"
-    plist_add_architecture $LIB_IOS_SIMULATOR_INDEX "arm64"
-    plist_add_architecture $LIB_IOS_SIMULATOR_INDEX "x86_64"
-
-    lipo -create -output  "${XCFRAMEWORK_DIR}/${IOS_LIB_IDENTIFIER}/WebRTC.framework/WebRTC" ${LIPO_IOS_FLAGS}
-    lipo -create -output "${XCFRAMEWORK_DIR}/${IOS_SIM_LIB_IDENTIFIER}/WebRTC.framework/WebRTC" ${LIPO_IOS_SIM_FLAGS}
-
-    # codesign simulator framework for local development.
-    # This makes it possible for Swift Packages to run Unit Tests and show SwiftUI Previews.
-    xcrun codesign -s - "${XCFRAMEWORK_DIR}/${IOS_SIM_LIB_IDENTIFIER}/WebRTC.framework/WebRTC"
-
-    LIB_COUNT=$((LIB_COUNT+2))
+    LIB_COUNT=$((LIB_COUNT+1))
 fi
 
-# Step 5.2 - Add macOS libs to XCFramework
+# Add macOS static libs
 if [ "$MACOS" = true ]; then
-
     MAC_LIB_IDENTIFIER="macos-x86_64_arm64"
 
     mkdir "${XCFRAMEWORK_DIR}/${MAC_LIB_IDENTIFIER}"
@@ -167,14 +106,14 @@ if [ "$MACOS" = true ]; then
     plist_add_architecture $LIB_COUNT "x86_64"
     plist_add_architecture $LIB_COUNT "arm64"
 
-    cp -RP out/macos-x64/WebRTC.framework "${XCFRAMEWORK_DIR}/${MAC_LIB_IDENTIFIER}"
-    lipo -create -output "${XCFRAMEWORK_DIR}/${MAC_LIB_IDENTIFIER}/WebRTC.framework/Versions/A/WebRTC" out/macos-x64/WebRTC.framework/WebRTC out/macos-arm64/WebRTC.framework/WebRTC
+    cp -RP out/macos-x64/libwebrtc.a "${XCFRAMEWORK_DIR}/${MAC_LIB_IDENTIFIER}"
+    cp -RP out/macos-arm64/libwebrtc.a "${XCFRAMEWORK_DIR}/${MAC_LIB_IDENTIFIER}"
+
     LIB_COUNT=$((LIB_COUNT+1))
 fi
 
-# Step 5.3 - macOS catalyst libs to XCFramework
+# Add macOS Catalyst static libs
 if [ "$MAC_CATALYST" = true ]; then
-
     CATALYST_LIB_IDENTIFIER="ios-x86_64_arm64-maccatalyst"
 
     mkdir "${XCFRAMEWORK_DIR}/${CATALYST_LIB_IDENTIFIER}"
@@ -182,21 +121,22 @@ if [ "$MAC_CATALYST" = true ]; then
     plist_add_architecture $LIB_COUNT "x86_64"
     plist_add_architecture $LIB_COUNT "arm64"
 
-    cp -RP out/catalyst-x64/WebRTC.framework "${XCFRAMEWORK_DIR}/${CATALYST_LIB_IDENTIFIER}"
-    lipo -create -output "${XCFRAMEWORK_DIR}/${CATALYST_LIB_IDENTIFIER}/WebRTC.framework/Versions/A/WebRTC" out/catalyst-x64/WebRTC.framework/WebRTC out/catalyst-arm64/WebRTC.framework/WebRTC
+    cp -RP out/catalyst-x64/libwebrtc.a "${XCFRAMEWORK_DIR}/${CATALYST_LIB_IDENTIFIER}"
+    cp -RP out/catalyst-arm64/libwebrtc.a "${XCFRAMEWORK_DIR}/${CATALYST_LIB_IDENTIFIER}"
+
     LIB_COUNT=$((LIB_COUNT+1))
 fi
 
-# Step 6 - Add license file to the framework
+# Step 5 - Add license file to the XCFramework
 cp LICENSE ${XCFRAMEWORK_DIR}
 
-# Step 7 - archive the framework
+# Step 6 - Archive the XCFramework
 cd out
 NOW=$(date -u +"%Y-%m-%dT%H-%M-%S")
-OUTPUT_NAME=WebRTC-$NOW.xcframework.zip
+OUTPUT_NAME=WebRTC-static-$NOW.xcframework.zip
 zip --symlinks -r $OUTPUT_NAME WebRTC.xcframework/
 
-# Step 8 calculate SHA256 checksum
+# Step 7 - Calculate SHA256 checksum
 CHECKSUM=$(shasum -a 256 $OUTPUT_NAME | awk '{ print $1 }')
 COMMIT_HASH=$(git rev-parse HEAD)
 
